@@ -133,7 +133,7 @@ export default function EarnHome({ navigation, route }: Props) {
     [filters]
   )
   const tokens = [...new Set(pools.flatMap((pool) => pool.tokens))]
-
+  console.log('pools', pools)
   const tokensInfo = useMemo(() => {
     return tokens
       .map((token) => allTokens[token.tokenId])
@@ -283,11 +283,7 @@ export default function EarnHome({ navigation, route }: Props) {
             handleScroll={handleScroll}
             listHeaderHeight={listHeaderHeight}
             paddingBottom={insets.bottom}
-            displayPools={displayPools.filter((pool) =>
-              pool.tokens.some((token) =>
-                tokenList.map((token) => token.tokenId).includes(token.tokenId)
-              )
-            )}
+            displayPools={pools}
             onPressLearnMore={onPressLearnMore}
           />
         )}

@@ -44,6 +44,8 @@ export const positionsWithBalanceSelector = createSelector([positionsSelector], 
 export const earnPositionsSelector = createSelector(
   [positionsSelector, earnPositionIdsSelector],
   (positions, earnPositionIds) => {
+    console.log('positions', positions)
+    console.log('earnPositionIds', earnPositionIds)
     const earnPositionIdsSet = new Set(earnPositionIds)
     return positions.filter(
       (position): position is EarnPosition =>

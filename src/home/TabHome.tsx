@@ -4,6 +4,7 @@ import _ from 'lodash'
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { LayoutChangeEvent, StyleSheet, Text, View } from 'react-native'
+import PieChart, { Slice } from 'react-native-pie-chart'
 import Animated, {
   interpolateColor,
   useAnimatedScrollHandler,
@@ -24,13 +25,15 @@ import {
   SHOW_TESTNET_BANNER,
   TIME_UNTIL_TOKEN_INFO_BECOMES_STALE,
 } from 'src/config'
-import EarnTabBar from 'src/earn/EarnTabBar'
 import PoolList from 'src/earn/PoolList'
 import { EarnTabType } from 'src/earn/types'
+import { getEarnPositionBalanceValues } from 'src/earn/utils'
 import { refreshAllBalances, visitHome } from 'src/home/actions'
 import AttentionIcon from 'src/icons/Attention'
 import ShakingCowHead from 'src/icons/ShakingCowHead'
 import { importContacts } from 'src/identity/actions'
+import { getLocalCurrencySymbol } from 'src/localCurrency/selectors'
+import { navigate } from 'src/navigator/NavigationService'
 import { Screens } from 'src/navigator/Screens'
 import { StackParamList } from 'src/navigator/types'
 import { refreshPositions } from 'src/positions/actions'
@@ -44,7 +47,8 @@ import { useDispatch, useSelector } from 'src/redux/hooks'
 import { initializeSentryUserContext } from 'src/sentry/actions'
 import Colors from 'src/styles/colors'
 import { typeScale } from 'src/styles/fonts'
-import { getShadowStyle, Shadow, Spacing } from 'src/styles/styles'
+import { Spacing } from 'src/styles/styles'
+import { useTotalTokenBalance } from 'src/tokens/hooks'
 import { tokensByIdSelector } from 'src/tokens/selectors'
 import { TokenBalance } from 'src/tokens/slice'
 import { hasGrantedContactsPermission } from 'src/utils/contacts'
@@ -176,13 +180,9 @@ function TabHome({ navigation, route }: Props) {
   }
 
   const displayPools = useMemo(() => {
-    const returnPools =
-      activeTab === EarnTabType.AllPools
-        ? pools
-        : pools.filter(
-            (pool) =>
-              new BigNumber(pool.balance).gt(0) && !!allTokens[pool.dataProps.depositTokenId]
-          )
+    const returnPools = pools.filter(
+      (pool) => new BigNumber(pool.balance).gt(0) && !!allTokens[pool.dataProps.depositTokenId]
+    )
     return returnPools.filter((pool) =>
       pool.tokens.some((poolToken) =>
         tokenList.map((token) => token.tokenId).includes(poolToken.tokenId)
@@ -200,6 +200,13 @@ function TabHome({ navigation, route }: Props) {
     dispatch(refreshPositions())
   }
 
+  const onPressInvest = () => {
+    navigate(Screens.InvestEnterAmount)
+  }
+
+  const totalTokenBalanceLocal = useTotalTokenBalance()
+  const localCurrencySymbol = useSelector(getLocalCurrencySymbol)
+
   const positionsStatus = useSelector(positionsStatusSelector)
   const positionsFetchedAt = useSelector(positionsFetchedAtSelector)
   const errorLoadingPools =
@@ -210,20 +217,59 @@ function TabHome({ navigation, route }: Props) {
   const zeroPoolsInMyPoolsTab =
     !errorLoadingPools && displayPools.length === 0 && activeTab === EarnTabType.MyPools
 
+  const colors = [Colors.primary, Colors.blue100, Colors.accent, Colors.gray5]
+  const series: Slice[] = displayPools.map((pool, index) => {
+    const { poolBalanceInUsd } = getEarnPositionBalanceValues({ pool })
+
+    const rewardAmount = pool.dataProps.earningItems.reduce(
+      (acc, earnItem) =>
+        acc.plus(
+          new BigNumber(earnItem.amount).times(
+            allTokens[earnItem.tokenId]?.priceUsd ?? new BigNumber(0)
+          )
+        ),
+      new BigNumber(0)
+    )
+    return {
+      value: rewardAmount.plus(poolBalanceInUsd).toNumber(),
+      color: colors[index],
+      label: {
+        text: `${pool.displayProps.title} ${pool.displayProps.description}`,
+        ...typeScale.labelSemiBoldSmall,
+        fill: Colors.white,
+      },
+    }
+  })
+  const totalPoolValue = new BigNumber(series.reduce((acc, slice) => acc + slice.value, 0))
   return (
     <>
-      <Animated.View testID="Home" style={styles.container}>
-        <Animated.View
-          style={[styles.listHeaderContainer, animatedListHeaderStyles]}
-          onLayout={handleMeasureListHeadereHeight}
-        >
-          <View
-            style={[styles.nonStickyHeaderContainer]}
-            onLayout={handleMeasureNonStickyHeaderHeight}
-          >
-            <EarnTabBar activeTab={activeTab} onChange={handleChangeActiveView} />
+      <Animated.ScrollView testID="Home" style={styles.container}>
+        {series.length === 0 && (
+          <>
+            <View style={styles.textContainer}>
+              <Text
+                style={styles.title}
+              >{`You have ${localCurrencySymbol}${totalTokenBalanceLocal?.toFormat(2)} of coins sitting around`}</Text>
+              <ShakingCowHead />
+            </View>
+            <View>
+              <Button
+                onPress={onPressInvest}
+                text={'Invest'}
+                type={BtnTypes.SECONDARY}
+                size={BtnSizes.FULL}
+              />
+            </View>
+          </>
+        )}
+        {series.length > 0 && (
+          <View style={styles.textContainer}>
+            <Text
+              style={styles.title}
+            >{`${localCurrencySymbol}${totalPoolValue?.toFormat(2)} Invested`}</Text>
+            <PieChart widthAndHeight={200} series={series} />
           </View>
-        </Animated.View>
+        )}
         {errorLoadingPools && (
           <View style={styles.textContainerError}>
             <View style={{ alignItems: 'center' }}>
@@ -247,15 +293,26 @@ function TabHome({ navigation, route }: Props) {
           </View>
         )}
         {!errorLoadingPools && !zeroPoolsInMyPoolsTab && (
-          <PoolList
-            handleScroll={handleScroll}
-            listHeaderHeight={listHeaderHeight}
-            paddingBottom={insets.bottom}
-            displayPools={displayPools}
-            onPressLearnMore={onPressLearnMore}
-          />
+          <>
+            <PoolList
+              handleScroll={handleScroll}
+              listHeaderHeight={0}
+              paddingBottom={insets.bottom}
+              displayPools={displayPools}
+              onPressLearnMore={onPressLearnMore}
+            />
+            {series.length > 0 && (
+              <Button
+                onPress={onPressInvest}
+                text={'Invest More'}
+                type={BtnTypes.PRIMARY}
+                size={BtnSizes.FULL}
+                style={{ marginHorizontal: Spacing.Regular16 }}
+              />
+            )}
+          </>
         )}
-      </Animated.View>
+      </Animated.ScrollView>
     </>
   )
 }
@@ -264,29 +321,16 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
   },
-  errorContainer: {
-    flex: 1,
-  },
-  listHeaderContainer: {
-    ...getShadowStyle(Shadow.SoftLight),
-    paddingHorizontal: Spacing.Regular16,
-    backgroundColor: Colors.background,
-    position: 'absolute',
-    width: '100%',
-    zIndex: 1,
-  },
-  nonStickyHeaderContainer: {
-    paddingTop: Spacing.Regular16,
-    zIndex: 1,
-    gap: Spacing.Thick24,
-    flexDirection: 'column',
+  title: {
+    ...typeScale.titleLarge,
   },
   textContainer: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    padding: Spacing.Thick24,
+    textAlign: 'center',
     backgroundColor: Colors.background,
+    padding: Spacing.Regular16,
   },
   textContainerError: {
     flex: 1,

@@ -16,6 +16,7 @@ export enum Screens {
   DebugImages = 'DebugImages',
   EarnInfoScreen = 'EarnInfoScreen',
   EarnEnterAmount = 'EarnEnterAmount',
+  InvestEnterAmount = 'InvestEnterAmount',
   EarnConfirmationScreen = 'EarnConfirmationScreen',
   EarnHome = 'EarnHome',
   EarnPoolInfoScreen = 'EarnPoolInfoScreen',

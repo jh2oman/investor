@@ -4,6 +4,15 @@ import { NetworkId } from 'src/transactions/types'
 import { SerializableTransactionRequest } from 'src/viem/preparedTransactionSerialization'
 import { Hash } from 'viem'
 
+export interface InvestInfo {
+  amount: string
+  split: string[]
+  preparedTransactions: SerializableTransactionRequest[]
+  pools: EarnPosition[]
+  fromTokenId: string
+  fromTokenAmount: string
+  registerTransactions: SerializableTransactionRequest[]
+}
 export interface DepositInfo {
   amount: string
   preparedTransactions: SerializableTransactionRequest[]

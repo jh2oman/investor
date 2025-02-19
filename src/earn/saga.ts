@@ -13,7 +13,7 @@ import {
   withdrawStart,
   withdrawSuccess,
 } from 'src/earn/slice'
-import { DepositInfo, WithdrawInfo } from 'src/earn/types'
+import { DepositInfo, InvestInfo, WithdrawInfo } from 'src/earn/types'
 import { isGasSubsidizedForNetwork } from 'src/earn/utils'
 import { navigateHome } from 'src/navigator/NavigationService'
 import { CANCELLED_PIN_INPUT } from 'src/pincode/authentication'
@@ -36,9 +36,14 @@ import Logger from 'src/utils/Logger'
 import { ensureError } from 'src/utils/ensureError'
 import { safely } from 'src/utils/safely'
 import { publicClient } from 'src/viem'
+import { ViemWallet } from 'src/viem/getLockableWallet'
+import { TransactionRequest } from 'src/viem/prepareTransactions'
 import { getPreparedTransactions } from 'src/viem/preparedTransactionSerialization'
 import { sendPreparedTransactions } from 'src/viem/saga'
-import { networkIdToNetwork } from 'src/web3/networkConfig'
+import { getViemWallet } from 'src/web3/contracts'
+import networkConfig, { networkIdToNetwork } from 'src/web3/networkConfig'
+import { getConnectedUnlockedAccount } from 'src/web3/saga'
+import { getNetworkFromNetworkId } from 'src/web3/utils'
 import { all, call, put, select, takeLeading } from 'typed-redux-saga'
 import { decodeFunctionData, erc20Abi } from 'viem'
 
@@ -69,248 +74,498 @@ function getDepositTxsReceiptAnalyticsProperties(
   }
 }
 
-export function* depositSubmitSaga(action: PayloadAction<DepositInfo>) {
-  const {
-    pool,
-    preparedTransactions: serializablePreparedTransactions,
-    amount,
-    mode,
-    fromTokenAmount,
-    fromTokenId,
-  } = action.payload
-  const depositTokenId = pool.dataProps.depositTokenId
-
-  const preparedTransactions = getPreparedTransactions(serializablePreparedTransactions)
-
-  const depositTokenInfo = yield* call(getTokenInfo, depositTokenId)
-  const fromTokenInfo = yield* call(getTokenInfo, fromTokenId)
-  if (!depositTokenInfo || !fromTokenInfo) {
-    Logger.error(
-      `${TAG}/depositSubmitSaga`,
-      `Token info not found for token ids ${depositTokenId} and/or ${fromTokenId}`
-    )
-    yield* put(depositError())
-    return
-  }
-
-  const tokensById = yield* select((state) =>
-    tokensByIdSelector(state, { networkIds: [pool.networkId], includePositionTokens: true })
-  )
-
-  const trackedTxs: TrackedTx[] = []
-  const poolNetworkId = pool.networkId
-  const fromNetworkId = fromTokenInfo.networkId
-  const commonAnalyticsProps = {
-    depositTokenId,
-    depositTokenAmount: amount,
-    networkId: poolNetworkId,
-    providerId: pool.appId,
-    poolId: pool.positionId,
-    fromTokenAmount,
-    fromTokenId,
-    fromNetworkId,
-    mode,
-    swapType:
-      mode === 'swap-deposit'
-        ? fromNetworkId === poolNetworkId
-          ? ('same-chain' as const)
-          : ('cross-chain' as const)
-        : undefined,
-  }
-
-  let submitted = false
-
+export function* sendPreparedRegistrationTransaction(
+  tx: TransactionRequest,
+  wallet: ViemWallet,
+  nonce: number
+) {
   try {
+    const signedTx = yield* call([wallet, 'signTransaction'], {
+      ...tx,
+      nonce,
+    } as any)
+    const hash = yield* call([wallet, 'sendRawTransaction'], {
+      serializedTransaction: signedTx,
+    })
+
     Logger.debug(
-      `${TAG}/depositSubmitSaga`,
-      `Starting ${mode} with token ${fromTokenId}, total transactions: ${preparedTransactions.length}`
+      `${TAG}/sendPreparedRegistrationTransactions`,
+      'Successfully sent transaction to the network',
+      hash
     )
+  } catch (error) {
+    Logger.error(
+      `${TAG}/sendPreparedRegistrationTransactions`,
+      `Failed to send or parse prepared registration transaction`,
+      error
+    )
+    throw error
+  }
+}
 
-    for (const tx of preparedTransactions) {
-      trackedTxs.push({
-        tx,
-        txHash: undefined,
-        txReceipt: undefined,
-      })
+export function* depositSubmitSaga(action: PayloadAction<DepositInfo | InvestInfo>) {
+  if (!('mode' in action.payload)) {
+    const {
+      pools,
+      preparedTransactions: serializablePreparedTransactions,
+      amount,
+      fromTokenAmount,
+      fromTokenId,
+      split,
+      registerTransactions: serializableRegisterTransactions,
+    } = action.payload
+    const fromTokenInfo = yield* call(getTokenInfo, fromTokenId)
+    if (!fromTokenInfo) {
+      Logger.error(`${TAG}/depositSubmitSaga`, `Token info not found for token id ${fromTokenId}`)
+      yield* put(depositError())
+      return
     }
+    const preparedTransactions = getPreparedTransactions(serializablePreparedTransactions)
+    const registerTransactions = getPreparedTransactions(serializableRegisterTransactions)
+    for (const tx of registerTransactions) {
+      let nonce = 0
+      const network = getNetworkFromNetworkId(fromTokenInfo.networkId)
+      if (!network) {
+        throw new Error(`No matching network found for network id: ${fromTokenInfo.networkId}`)
+      }
 
-    const createDepositStandbyTxHandlers = []
+      const wallet = yield* call(getViemWallet, networkConfig.viemChain[network])
+      yield* call(getConnectedUnlockedAccount)
+      yield* call(sendPreparedRegistrationTransaction, tx, wallet, nonce++)
+    }
+    const trackedTxs: TrackedTx[] = []
 
-    if (preparedTransactions.length <= 2) {
-      // if there are 1 or 2 transactions, its an approve (optional) and deposit
-      if (preparedTransactions.length > 1 && preparedTransactions[0].data) {
-        const { functionName, args } = decodeFunctionData({
-          abi: erc20Abi,
-          data: preparedTransactions[0].data,
+    let submitted = false
+
+    try {
+      for (const tx of preparedTransactions) {
+        trackedTxs.push({
+          tx,
+          txHash: undefined,
+          txReceipt: undefined,
         })
-        if (
-          functionName === 'approve' &&
-          preparedTransactions[0].to === fromTokenInfo.address &&
-          args
-        ) {
-          Logger.debug(`${TAG}/depositSubmitSaga`, 'First transaction is an approval transaction')
-          const approvedAmountInSmallestUnit = args[1] as bigint
-          const approvedAmount = new BigNumber(approvedAmountInSmallestUnit.toString())
-            .shiftedBy(-fromTokenInfo.decimals)
-            .toString()
+      }
+      const createDepositStandbyTxHandlers: any[] = []
 
-          const createApprovalStandbyTx = (
+      if (preparedTransactions.length === pools.length * 2) {
+        pools.forEach((pool, index) => {
+          const approvalTx = preparedTransactions[index * 2]
+          if (approvalTx.data) {
+            const { functionName, args } = decodeFunctionData({
+              abi: erc20Abi,
+              data: approvalTx.data,
+            })
+            if (
+              functionName === 'approve' &&
+              preparedTransactions[0].to === fromTokenInfo.address &&
+              args
+            ) {
+              Logger.debug(
+                `${TAG}/depositSubmitSaga`,
+                'First transaction is an approval transaction'
+              )
+              const approvedAmountInSmallestUnit = args[1] as bigint
+              const approvedAmount = new BigNumber(approvedAmountInSmallestUnit.toString())
+                .shiftedBy(-fromTokenInfo.decimals)
+                .toString()
+
+              const createApprovalStandbyTx = (
+                transactionHash: string,
+                feeCurrencyId?: string
+              ): BaseStandbyTransaction => {
+                return {
+                  context: newTransactionContext(TAG, 'Earn/Approve'),
+                  networkId: fromTokenInfo.networkId,
+                  type: TokenTransactionTypeV2.Approval,
+                  transactionHash,
+                  tokenId: fromTokenId,
+                  approvedAmount,
+                  feeCurrencyId,
+                }
+              }
+              createDepositStandbyTxHandlers.push(createApprovalStandbyTx)
+            } else {
+              Logger.info(
+                TAG,
+                'First transaction is not an expected approval transaction, using empty standby handler'
+              )
+              createDepositStandbyTxHandlers.push(() => null)
+            }
+          }
+          const createDepositStandbyTx = (
             transactionHash: string,
             feeCurrencyId?: string
           ): BaseStandbyTransaction => {
             return {
-              context: newTransactionContext(TAG, 'Earn/Approve'),
-              networkId: fromNetworkId,
-              type: TokenTransactionTypeV2.Approval,
+              context: newTransactionContext(TAG, 'Earn/Deposit'),
+              networkId: fromTokenInfo.networkId,
+              type: TokenTransactionTypeV2.EarnDeposit,
+              inAmount: {
+                value: new BigNumber(amount).times(new BigNumber(split[index])).toString(),
+                tokenId: pool.dataProps.withdrawTokenId,
+              },
+              outAmount: {
+                value: new BigNumber(amount).times(new BigNumber(split[index])).toString(),
+                tokenId: pool.dataProps.depositTokenId,
+              },
+              providerId: pool.appId,
               transactionHash,
-              tokenId: fromTokenId,
-              approvedAmount,
               feeCurrencyId,
             }
           }
-          createDepositStandbyTxHandlers.push(createApprovalStandbyTx)
-        } else {
-          Logger.info(
-            TAG,
-            'First transaction is not an expected approval transaction, using empty standby handler'
-          )
-          createDepositStandbyTxHandlers.push(() => null)
-        }
-      }
-
-      const createDepositStandbyTx = (
-        transactionHash: string,
-        feeCurrencyId?: string
-      ): BaseStandbyTransaction => {
-        return {
-          context: newTransactionContext(TAG, 'Earn/Deposit'),
-          networkId: fromNetworkId,
-          type: TokenTransactionTypeV2.EarnDeposit,
-          inAmount: {
-            value: amount,
-            tokenId: pool.dataProps.withdrawTokenId,
-          },
-          outAmount: {
-            value: amount,
-            tokenId: depositTokenId,
-          },
-          providerId: pool.appId,
-          transactionHash,
-          feeCurrencyId,
-        }
-      }
-      const createSwapDepositStandbyTx = (
-        transactionHash: string,
-        feeCurrencyId?: string
-      ): BaseStandbyTransaction => {
-        return {
-          context: newTransactionContext(TAG, 'Earn/SwapDeposit'),
-          networkId: fromNetworkId,
-          type: TokenTransactionTypeV2.EarnSwapDeposit,
-          swap: {
-            inAmount: { value: amount, tokenId: depositTokenId },
-            outAmount: { value: fromTokenAmount, tokenId: fromTokenId },
-          },
-          deposit: {
-            inAmount: { value: amount, tokenId: pool.dataProps.withdrawTokenId },
-            outAmount: { value: amount, tokenId: depositTokenId },
-            providerId: pool.appId,
-          },
-          transactionHash,
-          feeCurrencyId,
-        }
-      }
-      createDepositStandbyTxHandlers.push(
-        mode === 'deposit' ? createDepositStandbyTx : createSwapDepositStandbyTx
-      )
-    } else {
-      Logger.info(TAG, 'More than 2 deposit transactions, using empty standby handlers')
-      createDepositStandbyTxHandlers.push(...preparedTransactions.map(() => () => null))
-    }
-
-    AppAnalytics.track(EarnEvents.earn_deposit_submit_start, commonAnalyticsProps)
-
-    const txHashes = yield* call(
-      sendPreparedTransactions,
-      serializablePreparedTransactions,
-      fromNetworkId,
-      createDepositStandbyTxHandlers,
-      isGasSubsidizedForNetwork(fromNetworkId)
-    )
-    txHashes.forEach((txHash, i) => {
-      trackedTxs[i].txHash = txHash
-    })
-
-    Logger.debug(
-      `${TAG}/depositSubmitSaga`,
-      'Successfully sent deposit transaction(s) to the network',
-      txHashes
-    )
-
-    navigateHome()
-    submitted = true
-
-    // wait for the tx receipts, so that we can track them
-    Logger.debug(`${TAG}/depositSubmitSaga`, 'Waiting for transaction receipts')
-    const txReceipts = yield* all(
-      txHashes.map((txHash) => {
-        return call(
-          [publicClient[networkIdToNetwork[fromNetworkId]], 'waitForTransactionReceipt'],
-          {
-            hash: txHash,
+          const createSwapDepositStandbyTx = (
+            transactionHash: string,
+            feeCurrencyId?: string
+          ): BaseStandbyTransaction => {
+            return {
+              context: newTransactionContext(TAG, 'Earn/SwapDeposit'),
+              networkId: fromTokenInfo.networkId,
+              type: TokenTransactionTypeV2.EarnSwapDeposit,
+              swap: {
+                inAmount: {
+                  value: new BigNumber(amount).times(new BigNumber(split[index])).toString(),
+                  tokenId: pool.dataProps.depositTokenId,
+                },
+                outAmount: { value: fromTokenAmount, tokenId: fromTokenId },
+              },
+              deposit: {
+                inAmount: {
+                  value: new BigNumber(amount).times(new BigNumber(split[index])).toString(),
+                  tokenId: pool.dataProps.withdrawTokenId,
+                },
+                outAmount: {
+                  value: new BigNumber(amount).times(new BigNumber(split[index])).toString(),
+                  tokenId: pool.dataProps.depositTokenId,
+                },
+                providerId: pool.appId,
+              },
+              transactionHash,
+              feeCurrencyId,
+            }
           }
-        )
+          createDepositStandbyTxHandlers.push(
+            fromTokenInfo.tokenId === pool.dataProps.depositTokenId
+              ? createDepositStandbyTx
+              : createSwapDepositStandbyTx
+          )
+        })
+      }
+
+      const txHashes = yield* call(
+        sendPreparedTransactions,
+        serializablePreparedTransactions,
+        fromTokenInfo.networkId,
+        createDepositStandbyTxHandlers,
+        isGasSubsidizedForNetwork(fromTokenInfo.networkId)
+      )
+      txHashes.forEach((txHash, i) => {
+        trackedTxs[i].txHash = txHash
       })
-    )
-    txReceipts.forEach((receipt, index) => {
-      trackedTxs[index].txReceipt = receipt
+
       Logger.debug(
         `${TAG}/depositSubmitSaga`,
-        `Received transaction receipt ${index + 1} of ${txReceipts.length}`,
-        receipt
+        'Successfully sent deposit transaction(s) to the network',
+        txHashes
       )
-    })
 
-    const depositTxReceipt = txReceipts[txReceipts.length - 1]
-    if (depositTxReceipt.status !== 'success') {
-      throw new Error(`Deposit transaction reverted: ${depositTxReceipt?.transactionHash}`)
-    }
+      navigateHome()
+      submitted = true
 
-    // TODO(ACT-1514): for cross chain swaps, fire this when the tx feed
-    // confirms it, similar to swaps (or consider firing a  new event, since we
-    // have some gas properties here that can be useful for all txs)
-    AppAnalytics.track(EarnEvents.earn_deposit_submit_success, {
-      ...commonAnalyticsProps,
-      ...getDepositTxsReceiptAnalyticsProperties(trackedTxs, poolNetworkId, tokensById),
-    })
-    yield* put(
-      depositSuccess({
-        tokenId: depositTokenInfo.tokenId,
-        networkId: poolNetworkId,
-        transactionHash: txHashes[txHashes.length - 1],
+      // wait for the tx receipts, so that we can track them
+      Logger.debug(`${TAG}/depositSubmitSaga`, 'Waiting for transaction receipts')
+      const txReceipts = yield* all(
+        txHashes.map((txHash) => {
+          return call(
+            [
+              publicClient[networkIdToNetwork[fromTokenInfo.networkId]],
+              'waitForTransactionReceipt',
+            ],
+            {
+              hash: txHash,
+            }
+          )
+        })
+      )
+      txReceipts.forEach((receipt, index) => {
+        trackedTxs[index].txReceipt = receipt
+        Logger.debug(
+          `${TAG}/depositSubmitSaga`,
+          `Received transaction receipt ${index + 1} of ${txReceipts.length}`,
+          receipt
+        )
       })
-    )
-  } catch (err) {
-    if (err === CANCELLED_PIN_INPUT) {
-      Logger.info(`${TAG}/depositSubmitSaga`, 'Transaction cancelled by user')
-      yield* put(depositCancel())
-      AppAnalytics.track(EarnEvents.earn_deposit_submit_cancel, commonAnalyticsProps)
+
+      const depositTxReceipt = txReceipts[txReceipts.length - 1]
+      if (depositTxReceipt.status !== 'success') {
+        throw new Error(`Deposit transaction reverted: ${depositTxReceipt?.transactionHash}`)
+      }
+      yield* put(
+        depositSuccess({
+          tokenId: fromTokenId,
+          networkId: fromTokenInfo.networkId,
+          transactionHash: txHashes[txHashes.length - 1],
+        })
+      )
+    } catch (err) {
+      if (err === CANCELLED_PIN_INPUT) {
+        Logger.info(`${TAG}/depositSubmitSaga`, 'Transaction cancelled by user')
+        yield* put(depositCancel())
+        return
+      }
+
+      const error = ensureError(err)
+      Logger.error(`${TAG}/depositSubmitSaga`, 'Error sending deposit transaction', error)
+      yield* put(depositError())
+
+      // Only vibrate if we haven't already submitted the transaction
+      // since the user may be doing something else on the app by now
+      if (!submitted) {
+        vibrateError()
+      }
+    }
+  } else {
+    const {
+      pool,
+      preparedTransactions: serializablePreparedTransactions,
+      amount,
+      mode,
+      fromTokenAmount,
+      fromTokenId,
+    } = action.payload
+    const depositTokenId = pool.dataProps.depositTokenId
+
+    const preparedTransactions = getPreparedTransactions(serializablePreparedTransactions)
+
+    const depositTokenInfo = yield* call(getTokenInfo, depositTokenId)
+    const fromTokenInfo = yield* call(getTokenInfo, fromTokenId)
+    if (!depositTokenInfo || !fromTokenInfo) {
+      Logger.error(
+        `${TAG}/depositSubmitSaga`,
+        `Token info not found for token ids ${depositTokenId} and/or ${fromTokenId}`
+      )
+      yield* put(depositError())
       return
     }
 
-    const error = ensureError(err)
-    Logger.error(`${TAG}/depositSubmitSaga`, 'Error sending deposit transaction', error)
-    yield* put(depositError())
-    AppAnalytics.track(EarnEvents.earn_deposit_submit_error, {
-      ...commonAnalyticsProps,
-      error: error.message,
-      ...getDepositTxsReceiptAnalyticsProperties(trackedTxs, poolNetworkId, tokensById),
-    })
+    const tokensById = yield* select((state) =>
+      tokensByIdSelector(state, { networkIds: [pool.networkId], includePositionTokens: true })
+    )
 
-    // Only vibrate if we haven't already submitted the transaction
-    // since the user may be doing something else on the app by now
-    if (!submitted) {
-      vibrateError()
+    const trackedTxs: TrackedTx[] = []
+    const poolNetworkId = pool.networkId
+    const fromNetworkId = fromTokenInfo.networkId
+    const commonAnalyticsProps = {
+      depositTokenId,
+      depositTokenAmount: amount,
+      networkId: poolNetworkId,
+      providerId: pool.appId,
+      poolId: pool.positionId,
+      fromTokenAmount,
+      fromTokenId,
+      fromNetworkId,
+      mode,
+      swapType:
+        mode === 'swap-deposit'
+          ? fromNetworkId === poolNetworkId
+            ? ('same-chain' as const)
+            : ('cross-chain' as const)
+          : undefined,
+    }
+
+    let submitted = false
+
+    try {
+      Logger.debug(
+        `${TAG}/depositSubmitSaga`,
+        `Starting ${mode} with token ${fromTokenId}, total transactions: ${preparedTransactions.length}`
+      )
+
+      for (const tx of preparedTransactions) {
+        trackedTxs.push({
+          tx,
+          txHash: undefined,
+          txReceipt: undefined,
+        })
+      }
+
+      const createDepositStandbyTxHandlers = []
+
+      if (preparedTransactions.length <= 2) {
+        // if there are 1 or 2 transactions, its an approve (optional) and deposit
+        if (preparedTransactions.length > 1 && preparedTransactions[0].data) {
+          const { functionName, args } = decodeFunctionData({
+            abi: erc20Abi,
+            data: preparedTransactions[0].data,
+          })
+          if (
+            functionName === 'approve' &&
+            preparedTransactions[0].to === fromTokenInfo.address &&
+            args
+          ) {
+            Logger.debug(`${TAG}/depositSubmitSaga`, 'First transaction is an approval transaction')
+            const approvedAmountInSmallestUnit = args[1] as bigint
+            const approvedAmount = new BigNumber(approvedAmountInSmallestUnit.toString())
+              .shiftedBy(-fromTokenInfo.decimals)
+              .toString()
+
+            const createApprovalStandbyTx = (
+              transactionHash: string,
+              feeCurrencyId?: string
+            ): BaseStandbyTransaction => {
+              return {
+                context: newTransactionContext(TAG, 'Earn/Approve'),
+                networkId: fromNetworkId,
+                type: TokenTransactionTypeV2.Approval,
+                transactionHash,
+                tokenId: fromTokenId,
+                approvedAmount,
+                feeCurrencyId,
+              }
+            }
+            createDepositStandbyTxHandlers.push(createApprovalStandbyTx)
+          } else {
+            Logger.info(
+              TAG,
+              'First transaction is not an expected approval transaction, using empty standby handler'
+            )
+            createDepositStandbyTxHandlers.push(() => null)
+          }
+        }
+
+        const createDepositStandbyTx = (
+          transactionHash: string,
+          feeCurrencyId?: string
+        ): BaseStandbyTransaction => {
+          return {
+            context: newTransactionContext(TAG, 'Earn/Deposit'),
+            networkId: fromNetworkId,
+            type: TokenTransactionTypeV2.EarnDeposit,
+            inAmount: {
+              value: amount,
+              tokenId: pool.dataProps.withdrawTokenId,
+            },
+            outAmount: {
+              value: amount,
+              tokenId: depositTokenId,
+            },
+            providerId: pool.appId,
+            transactionHash,
+            feeCurrencyId,
+          }
+        }
+        const createSwapDepositStandbyTx = (
+          transactionHash: string,
+          feeCurrencyId?: string
+        ): BaseStandbyTransaction => {
+          return {
+            context: newTransactionContext(TAG, 'Earn/SwapDeposit'),
+            networkId: fromNetworkId,
+            type: TokenTransactionTypeV2.EarnSwapDeposit,
+            swap: {
+              inAmount: { value: amount, tokenId: depositTokenId },
+              outAmount: { value: fromTokenAmount, tokenId: fromTokenId },
+            },
+            deposit: {
+              inAmount: { value: amount, tokenId: pool.dataProps.withdrawTokenId },
+              outAmount: { value: amount, tokenId: depositTokenId },
+              providerId: pool.appId,
+            },
+            transactionHash,
+            feeCurrencyId,
+          }
+        }
+        createDepositStandbyTxHandlers.push(
+          mode === 'deposit' ? createDepositStandbyTx : createSwapDepositStandbyTx
+        )
+      } else {
+        Logger.info(TAG, 'More than 2 deposit transactions, using empty standby handlers')
+        createDepositStandbyTxHandlers.push(...preparedTransactions.map(() => () => null))
+      }
+
+      AppAnalytics.track(EarnEvents.earn_deposit_submit_start, commonAnalyticsProps)
+
+      const txHashes = yield* call(
+        sendPreparedTransactions,
+        serializablePreparedTransactions,
+        fromNetworkId,
+        createDepositStandbyTxHandlers,
+        isGasSubsidizedForNetwork(fromNetworkId)
+      )
+      txHashes.forEach((txHash, i) => {
+        trackedTxs[i].txHash = txHash
+      })
+
+      Logger.debug(
+        `${TAG}/depositSubmitSaga`,
+        'Successfully sent deposit transaction(s) to the network',
+        txHashes
+      )
+
+      navigateHome()
+      submitted = true
+
+      // wait for the tx receipts, so that we can track them
+      Logger.debug(`${TAG}/depositSubmitSaga`, 'Waiting for transaction receipts')
+      const txReceipts = yield* all(
+        txHashes.map((txHash) => {
+          return call(
+            [publicClient[networkIdToNetwork[fromNetworkId]], 'waitForTransactionReceipt'],
+            {
+              hash: txHash,
+            }
+          )
+        })
+      )
+      txReceipts.forEach((receipt, index) => {
+        trackedTxs[index].txReceipt = receipt
+        Logger.debug(
+          `${TAG}/depositSubmitSaga`,
+          `Received transaction receipt ${index + 1} of ${txReceipts.length}`,
+          receipt
+        )
+      })
+
+      const depositTxReceipt = txReceipts[txReceipts.length - 1]
+      if (depositTxReceipt.status !== 'success') {
+        throw new Error(`Deposit transaction reverted: ${depositTxReceipt?.transactionHash}`)
+      }
+
+      // TODO(ACT-1514): for cross chain swaps, fire this when the tx feed
+      // confirms it, similar to swaps (or consider firing a  new event, since we
+      // have some gas properties here that can be useful for all txs)
+      AppAnalytics.track(EarnEvents.earn_deposit_submit_success, {
+        ...commonAnalyticsProps,
+        ...getDepositTxsReceiptAnalyticsProperties(trackedTxs, poolNetworkId, tokensById),
+      })
+      yield* put(
+        depositSuccess({
+          tokenId: depositTokenInfo.tokenId,
+          networkId: poolNetworkId,
+          transactionHash: txHashes[txHashes.length - 1],
+        })
+      )
+    } catch (err) {
+      if (err === CANCELLED_PIN_INPUT) {
+        Logger.info(`${TAG}/depositSubmitSaga`, 'Transaction cancelled by user')
+        yield* put(depositCancel())
+        AppAnalytics.track(EarnEvents.earn_deposit_submit_cancel, commonAnalyticsProps)
+        return
+      }
+
+      const error = ensureError(err)
+      Logger.error(`${TAG}/depositSubmitSaga`, 'Error sending deposit transaction', error)
+      yield* put(depositError())
+      AppAnalytics.track(EarnEvents.earn_deposit_submit_error, {
+        ...commonAnalyticsProps,
+        error: error.message,
+        ...getDepositTxsReceiptAnalyticsProperties(trackedTxs, poolNetworkId, tokensById),
+      })
+
+      // Only vibrate if we haven't already submitted the transaction
+      // since the user may be doing something else on the app by now
+      if (!submitted) {
+        vibrateError()
+      }
     }
   }
 }

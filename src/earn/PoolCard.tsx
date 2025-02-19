@@ -7,7 +7,6 @@ import { EarnEvents } from 'src/analytics/Events'
 import { formatValueToDisplay } from 'src/components/TokenDisplay'
 import TokenIcon from 'src/components/TokenIcon'
 import Touchable from 'src/components/Touchable'
-import { TripleBars } from 'src/earn/poolInfoScreen/SafetyCard'
 import { getEarnPositionBalanceValues, getTotalYieldRate } from 'src/earn/utils'
 import { useDollarsToLocalAmount } from 'src/localCurrency/hooks'
 import { getLocalCurrencySymbol } from 'src/localCurrency/selectors'
@@ -116,35 +115,15 @@ export default function PoolCard({
               </Text>
             </View>
           </View>
-          {safety && (
-            <View>
-              <Text style={styles.safetyText}>{t('earnFlow.poolCard.safety')}</Text>
-              <TripleBars safety={safety} barHeights={BAR_HEIGHTS} />
-            </View>
-          )}
-        </View>
-        <View style={styles.keyValueContainer}>
-          <View style={styles.keyValueRow}>
-            <Text style={styles.keyText}>{t('earnFlow.poolCard.yieldRate')}</Text>
-            <Text style={styles.valueTextBold}>
+          <View style={styles.column}>
+            <Text style={styles.valueTextBold}>{poolBalanceString}</Text>
+            <Text style={styles.valueText}>
               {t('earnFlow.poolCard.percentage', {
                 percentage: totalYieldRate,
               })}
             </Text>
           </View>
-          <View style={styles.keyValueRow}>
-            <Text style={styles.keyText}>{t('earnFlow.poolCard.tvl')}</Text>
-            <Text style={styles.valueText}>{tvlString}</Text>
-          </View>
         </View>
-        {new BigNumber(balance).gt(0) && !!depositTokenInfo && (
-          <View style={styles.withBalanceContainer}>
-            <Text style={styles.keyText}>{t('earnFlow.poolCard.depositAndEarnings')}</Text>
-            <Text>
-              <Text style={styles.valueTextBold}>{poolBalanceString}</Text>
-            </Text>
-          </View>
-        )}
         <Text style={styles.poweredByText}>
           {t('earnFlow.poolCard.poweredBy', { providerName: appName })}
         </Text>
@@ -156,6 +135,10 @@ const styles = StyleSheet.create({
   card: {
     padding: Spacing.Regular16,
     backgroundColor: Colors.blue100,
+  },
+  column: {
+    flexDirection: 'column',
+    justifyContent: 'flex-end',
   },
   cardView: { gap: Spacing.Regular16 },
   titleRowToken: {

@@ -100,7 +100,7 @@ async function fetchPositions({
   supportedAppIds.forEach((appId) =>
     getEarnPositionsUrl.searchParams.append('supportedAppIds', appId)
   )
-
+  console.log('getEarnPositionsUrl', getEarnPositionsUrl)
   const options: RequestInit = { headers: { 'Accept-Language': language } }
 
   const [walletPositions, earnPositions] = await Promise.all([

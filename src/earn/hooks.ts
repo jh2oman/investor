@@ -3,6 +3,7 @@ import { useAsync, useAsyncCallback } from 'react-async-hook'
 import {
   prepareClaimTransactions,
   prepareDepositTransactions,
+  prepareInvestTransactions,
   prepareWithdrawAndClaimTransactions,
   prepareWithdrawTransactions,
   prepareWithdrawTransactionsWithSwap,
@@ -110,6 +111,24 @@ export function usePrepareEnterAmountTransactionsCallback(
       },
     }
   )
+
+  return {
+    prepareTransactionsResult: prepareTransactions.result,
+    refreshPreparedTransactions: prepareTransactions.execute,
+    clearPreparedTransactions: prepareTransactions.reset,
+    prepareTransactionError: prepareTransactions.error,
+    isPreparingTransactions: prepareTransactions.loading,
+  }
+}
+
+// Used on EarnEnterAmount.tsx with on user input with a debounced callback
+export function usePrepareInvestTransactionsCallback() {
+  const prepareTransactions = useAsyncCallback(async (args) => prepareInvestTransactions(args), {
+    onError: (err) => {
+      const error = ensureError(err)
+      Logger.error(TAG, 'usePrepareEnterAmountTransactions - Error:', error)
+    },
+  })
 
   return {
     prepareTransactionsResult: prepareTransactions.result,

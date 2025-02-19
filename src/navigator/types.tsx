@@ -82,6 +82,7 @@ export type StackParamList = {
     pool: EarnPosition
     mode?: Extract<EarnActiveMode, 'deposit' | 'swap-deposit' | 'withdraw'>
   }
+  [Screens.InvestEnterAmount]: undefined
   [Screens.EarnConfirmationScreen]: {
     pool: EarnPosition
     mode: Extract<EarnActiveMode, 'claim-rewards' | 'exit' | 'withdraw'>

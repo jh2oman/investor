@@ -16,6 +16,120 @@ import { Address } from 'viem'
 
 const TAG = 'earn/prepareTransactions'
 
+export async function prepareInvestTransactions({
+  amount,
+  token,
+  walletAddress,
+  feeCurrencies,
+  pools,
+  hooksApiUrl,
+  split,
+}: {
+  amount: string
+  token: TokenBalance
+  walletAddress: Address
+  feeCurrencies: TokenBalance[]
+  pools: EarnPosition[]
+  split: string[]
+  hooksApiUrl: string
+}) {
+  const depositTransactions = await Promise.all(
+    pools.map((pool, index) =>
+      getDepositTransaction({
+        amount: new BigNumber(amount).times(new BigNumber(split[index])).toString(),
+        token,
+        walletAddress,
+        pool,
+        hooksApiUrl,
+      })
+    )
+  )
+
+  return {
+    prepareTransactionsResult: await prepareTransactions({
+      feeCurrencies,
+      baseTransactions: rawShortcutTransactionsToTransactionRequests(
+        depositTransactions
+          .flat()
+          .map(({ transactions }) => transactions)
+          .flat()
+      ),
+      spendToken: token,
+      spendTokenAmount: new BigNumber(amount).shiftedBy(token.decimals),
+      isGasSubsidized: isGasSubsidizedForNetwork(token.networkId),
+      origin: `earn-deposit`,
+    }),
+    swapTransactions: depositTransactions
+      .map(({ dataProps }) => dataProps?.swapTransaction)
+      .filter((swapTransaction) => !!swapTransaction),
+  }
+}
+
+async function getDepositTransaction({
+  amount,
+  token,
+  walletAddress,
+  pool,
+  hooksApiUrl,
+}: {
+  amount: string
+  token: TokenBalance
+  walletAddress: Address
+  pool: EarnPosition
+  hooksApiUrl: string
+}) {
+  const { appId, networkId } = pool
+  const { enableAppFee } = getDynamicConfigParams(DynamicConfigs[StatsigDynamicConfigs.SWAP_CONFIG])
+  const shortcutId = token.tokenId === pool.dataProps.depositTokenId ? 'deposit' : 'swap-deposit'
+  const args =
+    shortcutId === 'deposit'
+      ? {
+          tokens: [
+            {
+              tokenId: token.tokenId,
+              amount,
+            },
+          ],
+        }
+      : {
+          swapFromToken: {
+            tokenId: token.tokenId,
+            amount,
+            decimals: token.decimals,
+            address: token.address,
+            isNative: token.isNative ?? false,
+            networkId: token.networkId,
+          },
+          enableAppFee,
+        }
+
+  const {
+    transactions,
+    dataProps,
+  }: { transactions: RawShortcutTransaction[]; dataProps?: { swapTransaction: SwapTransaction } } =
+    await triggerShortcutRequest(hooksApiUrl, {
+      address: walletAddress,
+      appId,
+      networkId,
+      shortcutId,
+      ...args,
+      ...pool.shortcutTriggerArgs?.[shortcutId],
+    })
+
+  if (shortcutId === 'swap-deposit' && !dataProps?.swapTransaction) {
+    Logger.error(
+      `${TAG}/prepareDepositTransactions`,
+      'Swap transaction not found in swap-deposit shortcut response',
+      { dataProps }
+    )
+    throw new Error('Swap transaction not found in swap-deposit shortcut response')
+  }
+  return {
+    transactions,
+    dataProps,
+  }
+}
+
 // Used on EarnEnterAmount.tsx
 export async function prepareDepositTransactions({
   amount,
