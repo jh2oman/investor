@@ -46,6 +46,7 @@ import { getConnectedUnlockedAccount } from 'src/web3/saga'
 import { getNetworkFromNetworkId } from 'src/web3/utils'
 import { all, call, put, select, takeLeading } from 'typed-redux-saga'
 import { decodeFunctionData, erc20Abi } from 'viem'
+import { getTransactionCount } from 'viem/actions'
 
 const TAG = 'earn/saga'
 
@@ -123,7 +124,6 @@ export function* depositSubmitSaga(action: PayloadAction<DepositInfo | InvestInf
     const preparedTransactions = getPreparedTransactions(serializablePreparedTransactions)
     const registerTransactions = getPreparedTransactions(serializableRegisterTransactions)
     for (const tx of registerTransactions) {
-      let nonce = 0
       const network = getNetworkFromNetworkId(fromTokenInfo.networkId)
       if (!network) {
         throw new Error(`No matching network found for network id: ${fromTokenInfo.networkId}`)
@@ -131,6 +131,15 @@ export function* depositSubmitSaga(action: PayloadAction<DepositInfo | InvestInf
 
       const wallet = yield* call(getViemWallet, networkConfig.viemChain[network])
       yield* call(getConnectedUnlockedAccount)
+      if (!wallet.account) {
+        // this should never happen
+        throw new Error('No account found in the wallet')
+      }
+      // @ts-ignore typed-redux-saga erases the parameterized types causing error, we can address this separately
+      let nonce: number = yield* call(getTransactionCount, wallet, {
+        address: wallet.account.address,
+        blockTag: 'pending',
+      })
       yield* call(sendPreparedRegistrationTransaction, tx, wallet, nonce++)
     }
     const trackedTxs: TrackedTx[] = []

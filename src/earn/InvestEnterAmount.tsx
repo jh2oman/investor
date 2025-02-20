@@ -45,13 +45,14 @@ import { typeScale } from 'src/styles/fonts'
 import { Spacing } from 'src/styles/styles'
 import { SwapTransaction } from 'src/swap/types'
 import { useSwappableTokens, useTokenInfo } from 'src/tokens/hooks'
-import { feeCurrenciesSelector } from 'src/tokens/selectors'
+import { feeCurrenciesByNetworkIdSelector, feeCurrenciesSelector } from 'src/tokens/selectors'
 import { TokenBalance } from 'src/tokens/slice'
 import Logger from 'src/utils/Logger'
 import { publicClient } from 'src/viem'
 import {
   getFeeCurrencyAndAmounts,
   PreparedTransactionsResult,
+  prepareTransactions,
   TransactionRequest,
 } from 'src/viem/prepareTransactions'
 import { getSerializablePreparedTransactions } from 'src/viem/preparedTransactionSerialization'
@@ -193,6 +194,8 @@ export default function InvestEnterAmount({ route }: Props) {
     feeCurrenciesSelector(state, transactionToken.networkId)
   )
 
+  const allFeeCurrencies = useSelector(feeCurrenciesByNetworkIdSelector)
+
   useEffect(() => {
     clearPreparedTransactions()
 
@@ -254,7 +257,7 @@ export default function InvestEnterAmount({ route }: Props) {
     const networkIds = new Set(pools.map((pool) => pool.networkId))
     const beefyProtocolHex = stringToHex('beefy', { size: 32 })
     const investorReferrerHex = stringToHex('investor', { size: 32 })
-    const registerTransactions = [] as TransactionRequest[]
+    const preparedRegisterTransactions = [] as TransactionRequest[][]
     for await (const networkId of networkIds) {
       const client = publicClient[networkIdToNetwork[networkId]]
       const isUserRegisteredForProtocols = await client.readContract({
@@ -263,8 +266,9 @@ export default function InvestEnterAmount({ route }: Props) {
         functionName: 'isUserRegistered',
         args: [walletAddress as Address, [beefyProtocolHex]],
       })
+      console.log('isUserRegisteredForProtocols', networkId, isUserRegisteredForProtocols)
       if (!isUserRegisteredForProtocols[0]) {
-        registerTransactions.push({
+        const registerTransaction: TransactionRequest = {
           from: walletAddress as Address,
           to: REGISTRY_CONTRACT_ADDRESS,
           data: encodeFunctionData({
@@ -272,10 +276,18 @@ export default function InvestEnterAmount({ route }: Props) {
             functionName: 'registerReferrals',
             args: [investorReferrerHex, [beefyProtocolHex]],
           }),
+        }
+
+        const preparedTransaction = await prepareTransactions({
+          feeCurrencies: allFeeCurrencies[networkId]!,
+          baseTransactions: [registerTransaction],
+          origin: 'earn-deposit',
         })
+        if (preparedTransaction.type === 'possible') {
+          preparedRegisterTransactions.push(preparedTransaction.transactions)
+        }
       }
     }
-
     // reviewBottomSheetRef.current?.snapToIndex(0)
     prepareTransactionsResult &&
       prepareTransactionsResult?.type === 'possible' &&
@@ -289,7 +301,9 @@ export default function InvestEnterAmount({ route }: Props) {
           ),
           fromTokenId: inputToken.tokenId,
           fromTokenAmount: processedAmounts.token.bignum.toString(),
-          registerTransactions: getSerializablePreparedTransactions(registerTransactions),
+          registerTransactions: getSerializablePreparedTransactions(
+            preparedRegisterTransactions.flat()
+          ),
         })
       )
   }

@@ -463,7 +463,7 @@ export const sortedTokensWithBalanceSelector = createSelector(
   (tokens) => tokens.filter((token) => token.balance.gt(TOKEN_MIN_AMOUNT))
 )
 
-const feeCurrenciesByNetworkIdSelector = createSelector(
+export const feeCurrenciesByNetworkIdSelector = createSelector(
   (state: RootState) => tokensByIdSelector(state, Object.values(NetworkId)),
   (tokens) => {
     const feeCurrenciesByNetworkId: { [key in NetworkId]?: TokenBalance[] } = {}
